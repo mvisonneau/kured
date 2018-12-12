@@ -31,6 +31,7 @@ var (
 	dsNamespace    string
 	dsName         string
 	lockAnnotation string
+	lockExpiration time.Duration
 	prometheusURL  string
 	alertFilter    *regexp.Regexp
 	rebootSentinel string
@@ -65,6 +66,8 @@ func main() {
 		"name of daemonset on which to place lock")
 	rootCmd.PersistentFlags().StringVar(&lockAnnotation, "lock-annotation", "weave.works/kured-node-lock",
 		"annotation in which to record locking node")
+	rootCmd.PersistentFlags().DurationVar(&lockExpiration, "lock-expiration", time.Minute*0,
+		"if not released, lock will automatically expire after this period (0 = disabled)")
 	rootCmd.PersistentFlags().StringVar(&prometheusURL, "prometheus-url", "",
 		"Prometheus instance to probe for active alerts")
 	rootCmd.PersistentFlags().Var(&regexpValue{&alertFilter}, "alert-filter-regexp",
@@ -178,7 +181,7 @@ func rebootBlocked(client *kubernetes.Clientset, nodeID string) bool {
 	return false
 }
 
-func holding(lock *daemonsetlock.DaemonSetLock, metadata interface{}) bool {
+func holding(lock *daemonsetlock.DaemonSetLock, metadata *daemonsetlock.NodeMeta) bool {
 	holding, err := lock.Test(metadata)
 	if err != nil {
 		log.Fatalf("Error testing lock: %v", err)
@@ -189,7 +192,7 @@ func holding(lock *daemonsetlock.DaemonSetLock, metadata interface{}) bool {
 	return holding
 }
 
-func acquire(lock *daemonsetlock.DaemonSetLock, metadata interface{}) bool {
+func acquire(lock *daemonsetlock.DaemonSetLock, metadata *daemonsetlock.NodeMeta) bool {
 	holding, holder, err := lock.Acquire(metadata)
 	switch {
 	case err != nil:
@@ -263,11 +266,6 @@ func maintainRebootRequiredMetric(nodeID string) {
 	}
 }
 
-// nodeMeta is used to remember information across reboots
-type nodeMeta struct {
-	Unschedulable bool `json:"unschedulable"`
-}
-
 func rebootAsRequired(nodeID string) {
 	config, err := rest.InClusterConfig()
 	if err != nil {
@@ -281,7 +279,7 @@ func rebootAsRequired(nodeID string) {
 
 	lock := daemonsetlock.New(client, nodeID, dsNamespace, dsName, lockAnnotation)
 
-	nodeMeta := nodeMeta{}
+	nodeMeta := daemonsetlock.NodeMeta{}
 	if holding(lock, &nodeMeta) {
 		if !nodeMeta.Unschedulable {
 			uncordon(nodeID)
@@ -298,6 +296,10 @@ func rebootAsRequired(nodeID string) {
 				log.Fatal(err)
 			}
 			nodeMeta.Unschedulable = node.Spec.Unschedulable
+
+			if lockExpiration.Seconds() > 0 {
+				nodeMeta.Expires = time.Now().Add(lockExpiration)
+			}
 
 			if acquire(lock, &nodeMeta) {
 				if !nodeMeta.Unschedulable {
@@ -323,6 +325,13 @@ func root(cmd *cobra.Command, args []string) {
 
 	log.Infof("Node ID: %s", nodeID)
 	log.Infof("Lock Annotation: %s/%s:%s", dsNamespace, dsName, lockAnnotation)
+
+	if lockExpiration.Seconds() > 0 {
+		log.Infof("Lock expire after %v seconds", lockExpiration.Seconds())
+	} else {
+		log.Info("Lock won't expire")
+	}
+
 	log.Infof("Reboot Sentinel: %s every %v", rebootSentinel, period)
 	log.Infof("Blocking Pod Selectors: %v", podSelectors)
 	log.Infof("Reboot Command: %s", command)
